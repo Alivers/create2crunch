@@ -37,94 +37,62 @@ static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
 /// CREATE2 that will be used to initialize the new contract. An additional set
 /// of three optional values may be provided: a device to target for OpenCL GPU
 /// search, a threshold for leading zeroes to search for, and a threshold for
-/// total zeroes to search for.
+/// total zeroes to search for. The prefix and suffix arguments may be used to search
+/// for addresses that start with a specific prefix or end with a specific suffix,
+/// as long as the prefix or suffix is provided, the leading_zeroes_threshold and
+/// total_zeroes_threshold arguments will be ignored.
+
+#[derive(clap::Parser, Debug)]
+#[command(version, about, long_about = None)]
 pub struct Config {
+    #[arg(short, long, value_parser = parse_address)]
     pub factory_address: [u8; 20],
+    #[arg(short, long, value_parser = parse_address)]
     pub calling_address: [u8; 20],
+    #[arg(short, long, value_parser = parse_word)]
     pub init_code_hash: [u8; 32],
+    #[arg(short, long, value_parser = parse_bytes)]
+    pub prefix: Option<std::vec::Vec<u8>>,
+    #[arg(short, long, value_parser = parse_bytes)]
+    pub suffix: Option<std::vec::Vec<u8>>,
+    #[arg(short, long, default_value_t = 255)]
     pub gpu_device: u8,
+    #[arg(short, long, default_value_t = 3)]
     pub leading_zeroes_threshold: u8,
+    #[arg(short, long, default_value_t = 5)]
     pub total_zeroes_threshold: u8,
 }
 
-/// Validate the provided arguments and construct the Config struct.
-impl Config {
-    pub fn new(mut args: std::env::Args) -> Result<Self, &'static str> {
-        // get args, skipping first arg (program name)
-        args.next();
+fn parse_address(s: &str) -> Result<[u8; 20], &'static str> {
+    let Ok(val) = hex::decode(s) else {
+        return Err("could not decode address argument");
+    };
 
-        let Some(factory_address_string) = args.next() else {
-            return Err("didn't get a factory_address argument");
-        };
-        let Some(calling_address_string) = args.next() else {
-            return Err("didn't get a calling_address argument");
-        };
-        let Some(init_code_hash_string) = args.next() else {
-            return Err("didn't get an init_code_hash argument");
-        };
+    let Ok(result) = val.try_into() else {
+        return Err("invalid length for address argument");
+    };
 
-        let gpu_device_string = match args.next() {
-            Some(arg) => arg,
-            None => String::from("255"), // indicates that CPU will be used.
-        };
-        let leading_zeroes_threshold_string = match args.next() {
-            Some(arg) => arg,
-            None => String::from("3"),
-        };
-        let total_zeroes_threshold_string = match args.next() {
-            Some(arg) => arg,
-            None => String::from("5"),
-        };
+    Ok(result)
+}
 
-        // convert main arguments from hex string to vector of bytes
-        let Ok(factory_address_vec) = hex::decode(factory_address_string) else {
-            return Err("could not decode factory address argument");
-        };
-        let Ok(calling_address_vec) = hex::decode(calling_address_string) else {
-            return Err("could not decode calling address argument");
-        };
-        let Ok(init_code_hash_vec) = hex::decode(init_code_hash_string) else {
-            return Err("could not decode initialization code hash argument");
-        };
+fn parse_word(s: &str) -> Result<[u8; 32], &'static str> {
+    let Ok(val) = hex::decode(s) else {
+        return Err("could not decode bytes32 argument");
+    };
 
-        // convert from vector to fixed array
-        let Ok(factory_address) = factory_address_vec.try_into() else {
-            return Err("invalid length for factory address argument");
-        };
-        let Ok(calling_address) = calling_address_vec.try_into() else {
-            return Err("invalid length for calling address argument");
-        };
-        let Ok(init_code_hash) = init_code_hash_vec.try_into() else {
-            return Err("invalid length for initialization code hash argument");
-        };
+    let Ok(result) = val.try_into() else {
+        return Err("invalid length for bytes32 argument");
+    };
 
-        // convert gpu arguments to u8 values
-        let Ok(gpu_device) = gpu_device_string.parse::<u8>() else {
-            return Err("invalid gpu device value");
-        };
-        let Ok(leading_zeroes_threshold) = leading_zeroes_threshold_string.parse::<u8>() else {
-            return Err("invalid leading zeroes threshold value supplied");
-        };
-        let Ok(total_zeroes_threshold) = total_zeroes_threshold_string.parse::<u8>() else {
-            return Err("invalid total zeroes threshold value supplied");
-        };
+    Ok(result)
+}
 
-        if leading_zeroes_threshold > 20 {
-            return Err("invalid value for leading zeroes threshold argument. (valid: 0..=20)");
-        }
-        if total_zeroes_threshold > 20 && total_zeroes_threshold != 255 {
-            return Err("invalid value for total zeroes threshold argument. (valid: 0..=20 | 255)");
-        }
+fn parse_bytes(s: &str) -> Result<Vec<u8>, &'static str> {
+    let Ok(result) = hex::decode(s) else {
+        return Err("could not decode bytes argument");
+    };
 
-        Ok(Self {
-            factory_address,
-            calling_address,
-            init_code_hash,
-            gpu_device,
-            leading_zeroes_threshold,
-            total_zeroes_threshold,
-        })
-    }
+    Ok(result)
 }
 
 /// Given a Config object with a factory address, a caller address, and a
@@ -147,6 +115,8 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
 
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
+
+    let find_sepcfied = config.prefix.is_some() || config.suffix.is_some();
 
     // begin searching for addresses
     loop {
@@ -184,30 +154,46 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                 // get the address that results from the hash
                 let address = <&Address>::try_from(&res[12..]).unwrap();
 
-                // count total and leading zero bytes
-                let mut total = 0;
-                let mut leading = 21;
-                for (i, &b) in address.iter().enumerate() {
-                    if b == 0 {
-                        total += 1;
-                    } else if leading == 21 {
-                        // set leading on finding non-zero byte
-                        leading = i;
+                let mut reward_amount = None;
+
+                if find_sepcfied {
+                    if let Some(prefix) = &config.prefix {
+                        if !address.starts_with(prefix) {
+                            return;
+                        }
                     }
-                }
 
-                // only proceed if there are at least three zero bytes
-                if total < 3 {
-                    return;
-                }
+                    if let Some(suffix) = &config.suffix {
+                        if !address.ends_with(suffix) {
+                            return;
+                        }
+                    }
+                } else {
+                    // count total and leading zero bytes
+                    let mut total = 0;
+                    let mut leading = 21;
+                    for (i, &b) in address.iter().enumerate() {
+                        if b == 0 {
+                            total += 1;
+                        } else if leading == 21 {
+                            // set leading on finding non-zero byte
+                            leading = i;
+                        }
+                    }
 
-                // look up the reward amount
-                let key = leading * 20 + total;
-                let reward_amount = rewards.get(&key);
+                    // only proceed if there are at least three zero bytes
+                    if total < 3 {
+                        return;
+                    }
 
-                // only proceed if an efficient address has been found
-                if reward_amount.is_none() {
-                    return;
+                    // look up the reward amount
+                    let key = leading * 20 + total;
+                    reward_amount = rewards.get(&key);
+
+                    // only proceed if an efficient address has been found
+                    if reward_amount.is_none() {
+                        return;
+                    }
                 }
 
                 // get the full salt used to create the address
@@ -267,6 +253,8 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
+
+    let find_sepcfied = config.prefix.is_some() || config.suffix.is_some();
 
     // track how many addresses have been found and information about them
     let mut found: u64 = 0;
@@ -507,20 +495,36 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             // get the address that results from the hash
             let address = <&Address>::try_from(&res[12..]).unwrap();
 
-            // count total and leading zero bytes
+            let mut reward = "0";
             let mut total = 0;
             let mut leading = 0;
-            for (i, &b) in address.iter().enumerate() {
-                if b == 0 {
-                    total += 1;
-                } else if leading == 0 {
-                    // set leading on finding non-zero byte
-                    leading = i;
+
+            if find_sepcfied {
+                if let Some(prefix) = &config.prefix {
+                    if !address.starts_with(prefix) {
+                        continue;
+                    }
                 }
+
+                if let Some(suffix) = &config.suffix {
+                    if !address.ends_with(suffix) {
+                        continue;
+                    }
+                }
+            } else {
+                // count total and leading zero bytes
+                for (i, &b) in address.iter().enumerate() {
+                    if b == 0 {
+                        total += 1;
+                    } else if leading == 0 {
+                        // set leading on finding non-zero byte
+                        leading = i;
+                    }
+                }
+                let key = leading * 20 + total;
+                reward = rewards.get(&key).unwrap_or("0");
             }
 
-            let key = leading * 20 + total;
-            let reward = rewards.get(&key).unwrap_or("0");
             let output = format!(
                 "0x{}{}{} => {} => {}",
                 hex::encode(config.calling_address),
