@@ -8,6 +8,7 @@ rust-version = "1.65"
 [dependencies]
 alloy-primitives = { version = "0.5", features = ["rand"] }
 byteorder = "1.5"
+clap = { version = "4.3.24", features = ["derive"] }
 console = "0.15"
 fs4 = "0.7"
 ocl = "0.19"
